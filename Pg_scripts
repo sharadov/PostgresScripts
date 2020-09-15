@@ -1,0 +1,614 @@
+-- show running queries (pre 9.2) dwiqa
+SELECT procpid, age(query_start, clock_timestamp()), usename, current_query
+FROM pg_stat_activity
+WHERE current_query != '<IDLE>' AND current_query NOT ILIKE '%pg_stat_activity%'
+ORDER BY query_start desc;
+
+-- show running queries (9.2)
+SELECT pid, age(query_start, clock_timestamp()), usename, query
+FROM pg_stat_activity
+WHERE query != '<IDLE>' AND query NOT ILIKE '%pg_stat_activity%'
+ORDER BY query_start desc;
+
+-- kill running query
+SELECT pg_cancel_backend(procpid);
+
+-- kill idle query
+SELECT pg_terminate_backend(procpid);
+
+-- kill long running
+select pg_terminate_backend(pid)
+from pg_stat_activity
+where usename = 'iuser'
+ and state = 'idle'
+ and query_start < current_timestamp - interval '5 minutes'
+;
+
+-- vacuum command
+VACUUM (VERBOSE, ANALYZE);
+-- last vaccum/analyze
+select relname,last_vacuum, last_autovacuum, last_analyze, last_autoanalyze from pg_stat_user_tables;
+
+ALTER table public.utterance set (autovacuum_analyze_scale_factor = 0.01,autovacuum_vacuum_scale_factor = 0.01);
+
+-- all database users
+select * from pg_stat_activity where current_query not like '<%';
+
+-- all databases and their sizes
+SELECT d.datname AS Name, pg_catalog.pg_get_userbyid(d.datdba) AS Owner,
+  CASE WHEN pg_catalog.has_database_privilege(d.datname, 'CONNECT')
+    THEN pg_catalog.pg_size_pretty(pg_catalog.pg_database_size(d.datname))
+    ELSE 'No Access'
+  END AS SIZE
+FROM pg_catalog.pg_database d
+ORDER BY
+  CASE WHEN pg_catalog.has_database_privilege(d.datname, 'CONNECT')
+    THEN pg_catalog.pg_database_size(d.datname)
+    ELSE NULL
+  END;
+
+-- quick row count
+SELECT schemaname,relname,n_live_tup FROM pg_stat_user_tables ORDER BY n_live_tup DESC;
+
+-- all tables and their size, with indexes
+
+SELECT
+    table_name,
+    pg_size_pretty(table_size) AS table_size,
+    pg_size_pretty(indexes_size) AS indexes_size,
+    pg_size_pretty(total_size) AS total_size
+FROM (
+    SELECT
+        table_name,
+        pg_table_size(table_name) AS table_size,
+        pg_indexes_size(table_name) AS indexes_size,
+        pg_total_relation_size(table_name) AS total_size
+    FROM (
+        SELECT ('"' || table_schema || '"."' || table_name || '"') AS table_name
+        FROM information_schema.tables
+    ) AS all_tables
+    ORDER BY total_size DESC
+) AS pretty_sizes;
+
+
+-- cache hit rates (should not be less than 0.99)
+SELECT sum(heap_blks_read) as heap_read, sum(heap_blks_hit)  as heap_hit, (sum(heap_blks_hit) - sum(heap_blks_read)) / sum(heap_blks_hit) as ratio
+FROM pg_statio_user_tables;
+
+-- table index usage rates (should not be less than 0.99)
+SELECT relname, 100 * idx_scan / (seq_scan + idx_scan) percent_of_times_index_used, n_live_tup rows_in_table
+FROM pg_stat_user_tables
+ORDER BY n_live_tup DESC;
+
+-- how many indexes are in cache
+SELECT sum(idx_blks_read) as idx_read, sum(idx_blks_hit)  as idx_hit, (sum(idx_blks_hit) - sum(idx_blks_read)) / sum(idx_blks_hit) as ratio
+FROM pg_statio_user_indexes;
+
+--- WAL archival
+SELECT *, current_setting('archive_mode')::BOOLEAN AND (last_failed_wal IS NULL OR last_failed_wal <= last_archived_wal) AS is_archiving, CAST (archived_count AS NUMERIC) / EXTRACT (EPOCH FROM age(now(), stats_reset)) AS current_archived_wals_per_second FROM pg_stat_archiver;
+
+-- Long running queries
+SELECT pid, age(query_start, clock_timestamp()), usename, query FROM pg_stat_activity
+WHERE query != '<IDLE>' AND query NOT ILIKE '%pg_stat_activity%'
+And now () - xact_start > '10 minutes'::interval
+ORDER BY query_start desc;
+
+
+— Group by IP
+
+
+
+SELECT client_addr, count(*) 
+FROM pg_stat_activity 
+WHERE client_addr is not null 
+GROUP BY client_addr; 
+
+-- Blocks and Blocking
+SELECT blocked_locks.pid    AS blocked_pid,
+        blocked_activity.usename  AS blocked_user,
+        blocking_locks.pid    AS blocking_pid,
+        blocking_activity.usename AS blocking_user,
+        blocked_activity.query    AS blocked_statement,
+        blocking_activity.query  AS current_statement_in_blocking_process
+  FROM  pg_catalog.pg_locks        blocked_locks
+    JOIN pg_catalog.pg_stat_activity blocked_activity  ON blocked_activity.pid = blocked_locks.pid
+    JOIN pg_catalog.pg_locks        blocking_locks
+        ON blocking_locks.locktype = blocked_locks.locktype
+        AND blocking_locks.DATABASE IS NOT DISTINCT FROM blocked_locks.DATABASE
+        AND blocking_locks.relation IS NOT DISTINCT FROM blocked_locks.relation
+        AND blocking_locks.page IS NOT DISTINCT FROM blocked_locks.page
+        AND blocking_locks.tuple IS NOT DISTINCT FROM blocked_locks.tuple
+        AND blocking_locks.virtualxid IS NOT DISTINCT FROM blocked_locks.virtualxid
+        AND blocking_locks.transactionid IS NOT DISTINCT FROM blocked_locks.transactionid
+        AND blocking_locks.classid IS NOT DISTINCT FROM blocked_locks.classid
+        AND blocking_locks.objid IS NOT DISTINCT FROM blocked_locks.objid
+        AND blocking_locks.objsubid IS NOT DISTINCT FROM blocked_locks.objsubid
+        AND blocking_locks.pid != blocked_locks.pid
+     JOIN pg_catalog.pg_stat_activity blocking_activity ON blocking_activity.pid = blocking_locks.pid
+   WHERE NOT blocked_locks.GRANTED;
+
+CPU Spikes
+
+-- Run top -c ( this will give the pids consuming high CPU)
+
+select * from pg_stat_activity where pid in (pid list from above)
+
+-- Table locks
+
+select pg_class.relname, pg_locks.*
+from pg_locks
+left outer join pg_class ON (pg_locks.relation = pg_class.oid)
+where pg_locks.relation = 'attmobility_mart_subdialog_error'::regclass;
+
+-- Grant permissions to tables
+
+SELECT DISTINCT 'GRANT '
+|| CASE schemaname WHEN 'pg_catalog' THEN 'USAGE' ELSE 'SELECT ON ALL TABLES' END
+|| ' IN SCHEMA ' || quote_ident(schemaname) || ' TO nocuser;'
+FROM pg_tables;
+
+
+
+ select  c.relname,l.*,psa.*
+ from pg_locks l
+ inner join pg_stat_activity psa ON (psa.pid = l.pid)
+ left outer join pg_class c ON (l.relation = c.oid)
+ where l.relation = 'attmobility_mart_subdialog_error'::regclass;
+
+--Privileges
+/du
+/dn+
+/dp
+
+SELECT table_catalog, table_schema, table_name, privilege_type
+FROM information_schema.table_privileges
+WHERE grantee = 'reportuser' and table_name like 'nor%';
+
+-- Replication
+
+-- on master
+
+select client_addr, state, sent_location, write_location,
+        flush_location, replay_location from pg_stat_replication;
+
+— replication delay 
+
+select now() - pg_last_xact_replay_timestamp() AS replication_delay;
+
+SELECT CASE WHEN pg_last_xlog_receive_location() =
+pg_last_xlog_replay_location() THEN 0 ELSE EXTRACT (EPOCH FROM now() -
+pg_last_xact_replay_timestamp()) END AS log_delay;
+
+SELECT
+pid,
+now() - pg_stat_activity.query_start AS duration,
+query,
+state
+FROM pg_stat_activity
+WHERE (now() - pg_stat_activity.query_start) > interval '5 minutes';
+
+Dump and Restore
+
+SELECT 'create database '||datname ||';' as "Name" 
+FROM pg_database;
+
+
+SELECT 'pg_dump -U postgres  '||datname ||'' as "Name" , 'psql -U postgres -h 172.18.5.237  '||datname ||'' as "Restore"
+FROM pg_database;
+
+
+pg_dump -U postgres -h 127.0.0.1 sms_db | psql -U postgres -h 172.23.56.45 sms_db
+
+— Include and exclude tables regex
+pg_dump -U postgres datamart -t "stat*" -T "statistics_mart_call_fact*" | psql -U postgres -h datamart203.wddl.il datamart 
+
+
+—get function definition
+SELECT pg_get_functiondef('production_score_part_insert'::regproc);
+
+psql -U postgres performancedb -c '\sf production_score_part_insert'
+— Dump Functions
+pg_dump -U postgres -Fc -s -f /tmp/func.sql datamart
+pg_restore -l /tmp/func.sql | grep FUNCTION > function_list
+pg_restore -U postgres -d datamart -L function_list func.sql
+
+pg_basebackup
+
+/opt/pgsql/PostgreSQL-10/bin/pg_basebackup -h datamart201.wddl.il -p 5432 -D /data/catalog/datamart --wal-method=stream --max-rate=15M &
+
+-r rate
+--max-rate=rate
+The maximum transfer rate of data transferred from the server. Values are in kilobytes per second. Use a suffix of M to indicate megabytes per second. A suffix of k is also accepted, and has no effect. Valid values are between 32 kilobytes per second and 1024 megabytes per second.
+
+Disinherit partitioned table
+ALTER TABLE child NO INHERIT parent;
+
+Kill all connections and drop the database
+
+SELECT pg_terminate_backend(pg_stat_activity.pid)
+FROM pg_stat_activity
+WHERE pg_stat_activity.datname = 'approver_platform_qa' 
+AND pid <> pg_backend_pid();
+drop database approver_platform_qa;
+
+Drop and add check constraint
+
+alter table atths_mart_call_fact_2018w22 drop constraint atths_mart_call_fact_2018w22_partition_check;
+alter table atths_mart_call_fact_2018w22 add constraint atths_mart_call_fact_2018w22_partition_check check (start_time >= '2018-05-28 00:00:00'::timestamp without time zone AND start_time < '2018-06-04 00:00:00'::timestamp without time zone);
+
+http://okigiveup.net/what-postgresql-tells-you-about-its-performance/
+
+https://github.com/pgexperts/pgx_scripts/tree/master/bloat
+
+Which dirs are taking space
+
+https://www.tecmint.com/find-top-large-directories-and-files-sizes-in-linux/
+
+Start/Stop Replication
+
+ 
+select pg_xlog_replay_pause();
+
+select pg_xlog_replay_resume();
+
+select  pg_is_xlog_replay_paused();
+Output query results to file
+postresql=> \o /path/to/your/text/file.txt
+postresql=> postgresql query ( here place your query ) 
+postresql=> \o ( set back the default output behavior )
+
+Show tablespaces
+
+/db+
+
+Move indexes to new tablespace
+
+SELECT ' ALTER TABLE '||schemaname||'.'||tablename||' SET TABLESPACE ssd;'
+
+FROM pg_tables
+
+WHERE schemaname NOT IN ('pg_catalog', 'information_schema’);
+
+
+Vacuum full all tables
+
+
+
+#!/bin/bash
+DATABASENAME=datamart
+DATABASEUSER=postgres
+for tablename in $(psql -U postgres -d $DATABASENAME -t -c "select table_schema||'.'||table_name as _table from information_schema.tables t where not exists( select isparent from ( select ns.nspname||'.'||relname as isparent from pg_class c join pg_namespace ns on ns.oid=c.relnamespace where c.oid in ( select i.inhparent from pg_inherits i group by inhparent having count(*)>0) ) a where a.isparent=t.table_schema||'.'||t.table_name ) order by _table"); do
+  echo $tablename
+  psql -U $DATABASEUSER -d $DATABASENAME -c "vacuum full analyze ${tablename};"
+done
+
+Console output to log (> is stdout, 2> is stderr, &> is both)
+
+
+psql mydb mydbuser -c "VACUUM ANALYZE VERBOSE" &> vacuum.log
+
+List all data types
+
+
+
+SELECT n.nspname AS schema,
+        pg_catalog.format_type ( t.oid, NULL ) AS name,
+        t.typname AS internal_name,
+        CASE
+            WHEN t.typrelid != 0
+            THEN CAST ( 'tuple' AS pg_catalog.text )
+            WHEN t.typlen < 0
+            THEN CAST ( 'var' AS pg_catalog.text )
+            ELSE CAST ( t.typlen AS pg_catalog.text )
+        END AS size,
+        pg_catalog.array_to_string (
+            ARRAY( SELECT e.enumlabel
+                    FROM pg_catalog.pg_enum e
+                    WHERE e.enumtypid = t.oid
+                    ORDER BY e.oid ), E'\n'
+            ) AS elements,
+        pg_catalog.obj_description ( t.oid, 'pg_type' ) AS description into UserTypes
+    FROM pg_catalog.pg_type t
+    LEFT JOIN pg_catalog.pg_namespace n
+        ON n.oid = t.typnamespace
+    WHERE ( t.typrelid = 0
+            OR ( SELECT c.relkind = 'c'
+                    FROM pg_catalog.pg_class c
+                    WHERE c.oid = t.typrelid
+                )
+        )
+        AND NOT EXISTS
+            ( SELECT 1
+                FROM pg_catalog.pg_type el
+                WHERE el.oid = t.typelem
+                    AND el.typarray = t.oid
+            )
+        AND n.nspname <> 'pg_catalog'
+        AND n.nspname <> 'information_schema'
+        AND pg_catalog.pg_type_is_visible ( t.oid )
+    ORDER BY 1, 2;
+
+List all functions
+
+SELECT n.nspname as "Schema",
+  p.proname as "Name",
+  pg_catalog.pg_get_function_result(p.oid) as "Result data type",
+  pg_catalog.pg_get_function_arguments(p.oid) as "Argument data types",
+ CASE
+  WHEN p.proisagg THEN 'agg'
+  WHEN p.proiswindow THEN 'window'
+  WHEN p.prorettype = 'pg_catalog.trigger'::pg_catalog.regtype THEN 'trigger'
+  ELSE 'normal'
+ END as "Type"
+FROM pg_catalog.pg_proc p
+     LEFT JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+WHERE pg_catalog.pg_function_is_visible(p.oid)
+      AND n.nspname <> 'pg_catalog'
+      AND n.nspname <> 'information_schema'
+ORDER BY 1, 2, 4;
+
+
+
+pg_stat_statements
+
+SELECT rolname,
+    calls,
+    total_time,
+    mean_time,
+    max_time,
+    stddev_time,
+    rows,
+    regexp_replace(query, '[ \t\n]+', ' ', 'g') AS query_text
+FROM pg_stat_statements
+JOIN pg_roles r ON r.oid = userid
+WHERE calls > 100
+AND rolname NOT LIKE '%backup'
+ORDER BY mean_time DESC
+LIMIT 10;
+
+#slow queries
+
+SELECT substring(query, 1, 500) AS short_query,
+round(total_time::numeric, 2) AS total_time,
+calls,
+round(mean_time::numeric, 2) AS mean,
+round((100 * total_time / sum(total_time::numeric) OVER ())::numeric, 2) AS percentage_cpu
+FROM pg_stat_statements ORDER BY total_time DESC LIMIT 10;
+
+https://www.virtual-dba.com/postgresql-performance-identifying-hot-and-slow-queries/
+
+
+
+Copy Command
+https://joshuaotwell.com/two-handy-examples-of-the-psql-copy-meta-command/
+
+fab_tracking=> \copy staging_assets FROM '~/Practice_Data/psql_pipe_tally.csv’ 
+WITH DELIMITER ',' CSV HEADER;
+COPY 35
+
+
+Drop tables
+
+SELECT 'drop table '||n.nspname ||'.'|| c.relname||';' as "Name" 
+FROM pg_catalog.pg_class c
+     LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relkind IN ('r','v','S','')
+     AND n.nspname <> 'pg_catalog'
+     AND n.nspname <> 'information_schema'
+     AND n.nspname !~ '^pg_toast'
+AND pg_catalog.pg_table_is_visible(c.oid);
+
+
+ SELECT 'drop table '||schemaname ||'.'|| tablename||';' as "Name" 
+FROM pg_tables
+WHERE tablename like '%2019w%';
+
+# Drop all FK constraints
+
+SELECT 'ALTER TABLE "'||nspname||'"."'||relname||'" DROP CONSTRAINT "'||conname||'";'
+ FROM pg_constraint 
+ INNER JOIN pg_class ON conrelid=pg_class.oid 
+ INNER JOIN pg_namespace ON pg_namespace.oid=pg_class.relnamespace 
+ where nspname = 'public' and relname like '%shine_mart%'
+ and contype ='f'
+ ORDER BY contype,nspname,relname,conname;
+
+
+
+#Create all FK constraints
+
+SELECT 'ALTER TABLE "'||nspname||'"."'||relname||'" ADD CONSTRAINT "'||conname||'" '||
+   pg_get_constraintdef(pg_constraint.oid)||';'
+ FROM pg_constraint
+ INNER JOIN pg_class ON conrelid=pg_class.oid
+ INNER JOIN pg_namespace ON pg_namespace.oid=pg_class.relnamespace
+ where nspname = 'public' and relname like '%shine%'
+ and contype ='f'
+ ORDER BY contype,nspname,relname,conname;
+
+
+# https://blog.hagander.net/automatically-dropping-and-creating-constraints-131/
+
+
+#Fastest way to delete a table
+
+
+https://www.keithf4.com/removing-old-data/
+
+
+# Check index bloat/fragmentation
+
+
+WITH constants AS (
+    -- define some constants for sizes of things
+    -- for reference down the query and easy maintenance
+    SELECT current_setting('block_size')::numeric AS bs, 23 AS hdr, 8 AS ma
+),
+no_stats AS (
+    -- screen out table who have attributes
+    -- which dont have stats, such as JSON
+    SELECT table_schema, table_name, 
+        n_live_tup::numeric as est_rows,
+        pg_table_size(relid)::numeric as table_size
+    FROM information_schema.columns
+        JOIN pg_stat_user_tables as psut
+           ON table_schema = psut.schemaname
+           AND table_name = psut.relname
+        LEFT OUTER JOIN pg_stats
+        ON table_schema = pg_stats.schemaname
+            AND table_name = pg_stats.tablename
+            AND column_name = attname 
+    WHERE attname IS NULL
+        AND table_schema NOT IN ('pg_catalog', 'information_schema')
+    GROUP BY table_schema, table_name, relid, n_live_tup
+),
+null_headers AS (
+    -- calculate null header sizes
+    -- omitting tables which dont have complete stats
+    -- and attributes which aren't visible
+    SELECT
+        hdr+1+(sum(case when null_frac <> 0 THEN 1 else 0 END)/8) as nullhdr,
+        SUM((1-null_frac)*avg_width) as datawidth,
+        MAX(null_frac) as maxfracsum,
+        schemaname,
+        tablename,
+        hdr, ma, bs
+    FROM pg_stats CROSS JOIN constants
+        LEFT OUTER JOIN no_stats
+            ON schemaname = no_stats.table_schema
+            AND tablename = no_stats.table_name
+    WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
+        AND no_stats.table_name IS NULL
+        AND EXISTS ( SELECT 1
+            FROM information_schema.columns
+                WHERE schemaname = columns.table_schema
+                    AND tablename = columns.table_name )
+    GROUP BY schemaname, tablename, hdr, ma, bs
+),
+data_headers AS (
+    -- estimate header and row size
+    SELECT
+        ma, bs, hdr, schemaname, tablename,
+        (datawidth+(hdr+ma-(case when hdr%ma=0 THEN ma ELSE hdr%ma END)))::numeric AS datahdr,
+        (maxfracsum*(nullhdr+ma-(case when nullhdr%ma=0 THEN ma ELSE nullhdr%ma END))) AS nullhdr2
+    FROM null_headers
+),
+table_estimates AS (
+    -- make estimates of how large the table should be
+    -- based on row and page size
+    SELECT schemaname, tablename, bs,
+        reltuples::numeric as est_rows, relpages * bs as table_bytes,
+    CEIL((reltuples*
+            (datahdr + nullhdr2 + 4 + ma -
+                (CASE WHEN datahdr%ma=0
+                    THEN ma ELSE datahdr%ma END)
+                )/(bs-20))) * bs AS expected_bytes,
+        reltoastrelid
+    FROM data_headers
+        JOIN pg_class ON tablename = relname
+        JOIN pg_namespace ON relnamespace = pg_namespace.oid
+            AND schemaname = nspname
+    WHERE pg_class.relkind = 'r'
+),
+estimates_with_toast AS (
+    -- add in estimated TOAST table sizes
+    -- estimate based on 4 toast tuples per page because we dont have 
+    -- anything better.  also append the no_data tables
+    SELECT schemaname, tablename, 
+        TRUE as can_estimate,
+        est_rows,
+        table_bytes + ( coalesce(toast.relpages, 0) * bs ) as table_bytes,
+        expected_bytes + ( ceil( coalesce(toast.reltuples, 0) / 4 ) * bs ) as expected_bytes
+    FROM table_estimates LEFT OUTER JOIN pg_class as toast
+        ON table_estimates.reltoastrelid = toast.oid
+            AND toast.relkind = 't'
+),
+table_estimates_plus AS (
+-- add some extra metadata to the table data
+-- and calculations to be reused
+-- including whether we cant estimate it
+-- or whether we think it might be compressed
+    SELECT current_database() as databasename,
+            schemaname, tablename, can_estimate, 
+            est_rows,
+            CASE WHEN table_bytes > 0
+                THEN table_bytes::NUMERIC
+                ELSE NULL::NUMERIC END
+                AS table_bytes,
+            CASE WHEN expected_bytes > 0 
+                THEN expected_bytes::NUMERIC
+                ELSE NULL::NUMERIC END
+                    AS expected_bytes,
+            CASE WHEN expected_bytes > 0 AND table_bytes > 0
+                AND expected_bytes <= table_bytes
+                THEN (table_bytes - expected_bytes)::NUMERIC
+                ELSE 0::NUMERIC END AS bloat_bytes
+    FROM estimates_with_toast
+    UNION ALL
+    SELECT current_database() as databasename, 
+        table_schema, table_name, FALSE, 
+        est_rows, table_size,
+        NULL::NUMERIC, NULL::NUMERIC
+    FROM no_stats
+),
+bloat_data AS (
+    -- do final math calculations and formatting
+    select current_database() as databasename,
+        schemaname, tablename, can_estimate, 
+        table_bytes, round(table_bytes/(1024^2)::NUMERIC,3) as table_mb,
+        expected_bytes, round(expected_bytes/(1024^2)::NUMERIC,3) as expected_mb,
+        round(bloat_bytes*100/table_bytes) as pct_bloat,
+        round(bloat_bytes/(1024::NUMERIC^2),2) as mb_bloat,
+        table_bytes, expected_bytes, est_rows
+    FROM table_estimates_plus
+)
+-- filter output for bloated tables
+SELECT databasename, schemaname, tablename,
+    can_estimate,
+    est_rows,
+    pct_bloat, mb_bloat,
+    table_mb
+FROM bloat_data
+-- this where clause defines which tables actually appear
+-- in the bloat chart
+-- example below filters for tables which are either 50%
+-- bloated and more than 20mb in size, or more than 25%
+-- bloated and more than 1GB in size
+WHERE ( pct_bloat >= 50 AND mb_bloat >= 20 )
+    OR ( pct_bloat >= 25 AND mb_bloat >= 1000 )
+ORDER BY pct_bloat DESC;
+
+
+# Vacuum configuration based on individual tables
+
+SELECT psut.relname,
+     to_char(psut.last_vacuum, 'YYYY-MM-DD HH24:MI') as last_vacuum,
+     to_char(psut.last_autovacuum, 'YYYY-MM-DD HH24:MI') as last_autovacuum,
+     to_char(pg_class.reltuples, '9G999G999G999') AS n_tup,
+     to_char(psut.n_dead_tup, '9G999G999G999') AS dead_tup,
+     to_char(CAST(current_setting('autovacuum_vacuum_threshold') AS bigint)
+         + (CAST(current_setting('autovacuum_vacuum_scale_factor') AS numeric)
+            * pg_class.reltuples), '9G999G999G999') AS av_threshold,
+     CASE
+         WHEN CAST(current_setting('autovacuum_vacuum_threshold') AS bigint)
+             + (CAST(current_setting('autovacuum_vacuum_scale_factor') AS numeric)
+                * pg_class.reltuples) < psut.n_dead_tup
+         THEN '*'
+         ELSE ''
+     END AS expect_av
+ FROM pg_stat_user_tables psut
+     JOIN pg_class on psut.relid = pg_class.oid
+ ORDER BY 1;
+
+# Promote replica to master
+
+Shutdown the old master - pg_ctl stop
+Promote the replica to master - pg_ctl promote -D /data/pgdata/performancedb
+Check status - pg_ctl status
+
+# archive command
+
+#archive_command = '/usr/local/pgsql/bin/archive_wal.sh %p %f'
+#archive_command = '/usr/local/pgsql/bin/archive_wal.sh %p %f && /usr/local/pgsql/bin/copy_wals_barman.sh %p %f'
+#archive_command = '/usr/local/pgsql/bin/copy_wals_barman.sh %p %f'
+archive_command = 'cp %p /wal/datamart/%f'
